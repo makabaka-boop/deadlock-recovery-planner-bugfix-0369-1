@@ -25,6 +25,9 @@ from deadlock_simulator import (
     simulate,
     solve,
 )
+from checkpoint_model import parse_checkpoints
+from checkpoint_recovery import solve_checkpoints
+from checkpoint_runtime import replay
 from backend_server import create_server
 
 
@@ -489,6 +492,33 @@ class ServerTests(unittest.TestCase):
         self.assertEqual(status, 400)
         self.assertIn("error", data)
 
+    def test_non_object_payload_returns_400(self):
+        status, data = self._post("/simulate", "nope")
+        self.assertEqual(status, 400)
+        self.assertIn("error", data)
+
+    def test_checkpoint_mode_endpoint(self):
+        payload = mk_checkpoint_payload(
+            [{"id": 1, "holding": [1], "waiting_for": 2, "abortable": False},
+             {"id": 2, "holding": [2], "waiting_for": 1, "abortable": False}],
+            [{"id": "c1", "job": 1, "keep": [], "cost": 4},
+             {"id": "c2", "job": 2, "keep": [], "cost": 6}],
+        )
+        status, data = self._post("/simulate", payload)
+        self.assertEqual(status, 200)
+        self.assertEqual(data["status"], "recovered")
+        self.assertEqual(data["checkpoints"], ["c1"])
+        self.assertEqual(data["cost"], 4)
+
+    def test_checkpoint_mode_invalid_payload_returns_400(self):
+        payload = mk_checkpoint_payload(
+            [{"id": 1, "holding": [1], "waiting_for": 2, "abortable": False}],
+            [{"id": "k1", "job": 1, "keep": [2], "cost": 1}],
+        )
+        status, data = self._post("/simulate", payload)
+        self.assertEqual(status, 400)
+        self.assertIn("error", data)
+
     def test_health_endpoint(self):
         conn = http.client.HTTPConnection("127.0.0.1", self.port)
         conn.request("GET", "/health")
@@ -496,6 +526,336 @@ class ServerTests(unittest.TestCase):
         self.assertEqual(response.status, 200)
         self.assertEqual(json.loads(response.read()), {"status": "ok"})
         conn.close()
+
+
+# ---------------------------------------------------------------------------
+# Checkpoint recovery
+# ---------------------------------------------------------------------------
+
+def mk_checkpoint_payload(job_specs, checkpoints, extra_resources=()):
+    payload = mk_payload(job_specs, extra_resources)
+    payload["mode"] = "checkpoint"
+    payload["checkpoints"] = checkpoints
+    return payload
+
+
+def replay_checkpoint_events(payload, events):
+    """Independently re-apply a checkpoint-mode replay from scratch.
+
+    Shares no code with the simulator/runtime: rollback, grant and complete
+    events are checked against a locally maintained state that follows the
+    documented semantics -- a rolled-back job keeps its original wait, then
+    re-acquires the released resources in ascending id order, one at a time,
+    and may complete only once nothing is left to acquire.
+    """
+    holding = {j["id"]: set(j.get("holding", [])) for j in payload["jobs"]}
+    waiting = {j["id"]: j.get("waiting_for") for j in payload["jobs"]}
+    holder = {r["id"]: r.get("holder") for r in payload["resources"]}
+    active = set(holding)
+    needs = {j: [] for j in holding}
+    checkpoints = {c["id"]: c for c in payload.get("checkpoints", [])}
+    for ev in events:
+        kind = ev["type"]
+        if kind == "rollback":
+            j = ev["job"]
+            assert j in active, f"rollback of inactive job {j}"
+            cp = checkpoints[ev["checkpoint"]]
+            assert cp["job"] == j, f"checkpoint {ev['checkpoint']} belongs to job {cp['job']}"
+            keep = set(cp["keep"])
+            assert keep <= holding[j], f"job {j} cannot retain {keep - holding[j]}"
+            assert ev["released"] == sorted(holding[j] - keep), f"job {j} released set mismatch"
+            assert ev["retained"] == sorted(keep), f"job {j} retained set mismatch"
+            for r in holding[j] - keep:
+                assert holder[r] == j, f"resource {r} not held by job {j}"
+                holder[r] = None
+            holding[j] = set(keep)
+            needs[j] = list(ev["released"])
+            if waiting[j] is None and needs[j]:
+                waiting[j] = needs[j].pop(0)
+        elif kind == "grant":
+            j, r = ev["job"], ev["resource"]
+            assert j in active, f"grant to inactive job {j}"
+            assert waiting[j] == r, f"job {j} is not waiting for resource {r}"
+            assert holder[r] is None, f"resource {r} is not idle"
+            holder[r] = j
+            holding[j].add(r)
+            waiting[j] = needs[j].pop(0) if needs[j] else None
+        elif kind == "complete":
+            j = ev["job"]
+            assert j in active, f"complete event for inactive job {j}"
+            assert waiting[j] is None, f"job {j} completes while still waiting"
+            assert not needs[j], f"job {j} completes with re-acquisitions pending"
+            assert sorted(holding[j]) == ev["released"], f"job {j} released set mismatch"
+            for r in holding[j]:
+                assert holder[r] == j, f"resource {r} not held by job {j}"
+                holder[r] = None
+            holding[j] = set()
+            active.discard(j)
+        else:
+            raise AssertionError(f"unknown event type {kind!r}")
+    return active, waiting, holder
+
+
+def brute_force_min_checkpoints(payload):
+    """Enumerate every legal checkpoint combination (at most one per stuck
+    job) and return the minimum (cost, sorted ids) that lets every job
+    complete; ``[]`` when no rollback is needed, ``None`` when none works."""
+    state, options = parse_checkpoints(payload)
+    _, stuck = simulate(state)
+    if not stuck:
+        return []
+    by_job = {}
+    for option in options:
+        if option["job"] in stuck:
+            by_job.setdefault(option["job"], []).append(option)
+    best = None
+    for size in range(1, len(by_job) + 1):
+        for job_subset in itertools.combinations(sorted(by_job), size):
+            for subset in itertools.product(*(by_job[j] for j in job_subset)):
+                _, _, left = replay(state, subset)
+                if left:
+                    continue
+                key = (sum(o["cost"] for o in subset),
+                       sorted(o["id"] for o in subset))
+                if best is None or key < best:
+                    best = key
+    return best
+
+
+def random_checkpoint_payload(rng):
+    payload = random_payload(rng)
+    checkpoints = []
+    for i in range(rng.randint(0, 6)):
+        job = rng.choice(payload["jobs"])
+        keep = [r for r in job.get("holding", []) if rng.random() < 0.5]
+        checkpoints.append({"id": f"cp{i}", "job": job["id"],
+                            "keep": keep, "cost": rng.randint(1, 9)})
+    payload["mode"] = "checkpoint"
+    payload["checkpoints"] = checkpoints
+    return payload
+
+
+class CheckpointRecoveryTests(unittest.TestCase):
+    def test_no_deadlock_ignores_checkpoints(self):
+        payload = mk_checkpoint_payload(
+            [{"id": 1, "holding": [1], "waiting_for": None, "abortable": False}],
+            [{"id": "k1", "job": 1, "keep": [], "cost": 1}],
+        )
+        result = solve_checkpoints(payload)
+        self.assertEqual(result["status"], "completed")
+        self.assertEqual(result["checkpoints"], [])
+        self.assertEqual(result["cost"], 0)
+        self.assertEqual(result["events"],
+                         [{"type": "complete", "job": 1, "released": [1]}])
+
+    def test_protected_jobs_may_roll_back_with_declared_checkpoints(self):
+        # Both jobs are protected: abort mode would report unresolvable, but
+        # each declares a checkpoint and rolling job 1 back is cheapest.
+        payload = mk_checkpoint_payload(
+            [{"id": 1, "holding": [1], "waiting_for": 2, "abortable": False},
+             {"id": 2, "holding": [2], "waiting_for": 1, "abortable": False}],
+            [{"id": "c1", "job": 1, "keep": [], "cost": 4},
+             {"id": "c2", "job": 2, "keep": [], "cost": 6}],
+        )
+        result = solve_checkpoints(payload)
+        self.assertEqual(result["status"], "recovered")
+        self.assertEqual(result["checkpoints"], ["c1"])
+        self.assertEqual(result["cost"], 4)
+        self.assertEqual(result["events"], [
+            {"type": "rollback", "job": 1, "checkpoint": "c1",
+             "released": [1], "retained": []},
+            {"type": "grant", "job": 2, "resource": 1},
+            {"type": "complete", "job": 2, "released": [1, 2]},
+            {"type": "grant", "job": 1, "resource": 2},   # original wait first
+            {"type": "grant", "job": 1, "resource": 1},   # then re-acquire r1
+            {"type": "complete", "job": 1, "released": [1, 2]},
+        ])
+        active, _, holder = replay_checkpoint_events(payload, result["events"])
+        self.assertEqual(active, set())
+        self.assertTrue(all(h is None for h in holder.values()))
+
+    def test_rolled_back_job_reacquires_resources_before_completing(self):
+        payload = mk_checkpoint_payload(
+            [{"id": 1, "holding": [1, 2], "waiting_for": 3,
+              "abortable": True, "abort_cost": 9},
+             {"id": 2, "holding": [3], "waiting_for": 2, "abortable": False}],
+            [{"id": "k1", "job": 1, "keep": [1], "cost": 2}],
+        )
+        result = solve_checkpoints(payload)
+        self.assertEqual(result["status"], "recovered")
+        self.assertEqual(result["cost"], 2)
+        self.assertEqual(result["checkpoints"], ["k1"])
+        self.assertEqual(result["events"], [
+            {"type": "rollback", "job": 1, "checkpoint": "k1",
+             "released": [2], "retained": [1]},
+            {"type": "grant", "job": 2, "resource": 2},
+            {"type": "complete", "job": 2, "released": [2, 3]},
+            {"type": "grant", "job": 1, "resource": 3},   # original wait
+            {"type": "grant", "job": 1, "resource": 2},   # re-acquire released
+            {"type": "complete", "job": 1, "released": [1, 2, 3]},
+        ])
+        active, _, holder = replay_checkpoint_events(payload, result["events"])
+        self.assertEqual(active, set())
+        self.assertTrue(all(h is None for h in holder.values()))
+
+    def test_cheaper_checkpoint_of_same_job_is_not_imposed_when_infeasible(self):
+        # ck_lo is cheaper but releases nothing, so the cycle survives; the
+        # solver must fall through to the feasible, more expensive ck_hi.
+        payload = mk_checkpoint_payload(
+            [{"id": 1, "holding": [1, 2], "waiting_for": 3,
+              "abortable": True, "abort_cost": 5},
+             {"id": 2, "holding": [3], "waiting_for": 2, "abortable": False}],
+            [{"id": "ck_lo", "job": 1, "keep": [1, 2], "cost": 1},
+             {"id": "ck_hi", "job": 1, "keep": [1], "cost": 3}],
+        )
+        result = solve_checkpoints(payload)
+        self.assertEqual(result["status"], "recovered")
+        self.assertEqual(result["checkpoints"], ["ck_hi"])
+        self.assertEqual(result["cost"], 3)
+        active, _, _ = replay_checkpoint_events(payload, result["events"])
+        self.assertEqual(active, set())
+
+    def test_equal_cost_tie_breaks_on_sorted_checkpoint_ids(self):
+        payload = mk_checkpoint_payload(
+            [{"id": 1, "holding": [1], "waiting_for": 2,
+              "abortable": True, "abort_cost": 9},
+             {"id": 2, "holding": [2], "waiting_for": 1,
+              "abortable": True, "abort_cost": 9}],
+            [{"id": "b1", "job": 1, "keep": [], "cost": 2},
+             {"id": "a2", "job": 2, "keep": [], "cost": 2}],
+        )
+        result = solve_checkpoints(payload)
+        self.assertEqual(result["status"], "recovered")
+        self.assertEqual(result["checkpoints"], ["a2"])   # ["a2"] < ["b1"]
+        self.assertEqual(result["cost"], 2)
+        active, _, _ = replay_checkpoint_events(payload, result["events"])
+        self.assertEqual(active, set())
+
+    def test_unresolvable_when_no_checkpoint_combination_is_legal(self):
+        payload = mk_checkpoint_payload(
+            [{"id": 1, "holding": [1], "waiting_for": 2, "abortable": False},
+             {"id": 2, "holding": [2], "waiting_for": 1, "abortable": False}],
+            [{"id": "k1", "job": 1, "keep": [1], "cost": 1}],  # releases nothing
+        )
+        result = solve_checkpoints(payload)
+        self.assertEqual(result["status"], "unresolvable")
+        self.assertEqual(result["stuck"], [1, 2])
+        self.assertFalse(any(ev["type"] == "rollback" for ev in result["events"]))
+
+    def test_unresolvable_without_any_checkpoints(self):
+        payload = mk_checkpoint_payload(
+            [{"id": 1, "holding": [1], "waiting_for": 2, "abortable": False},
+             {"id": 2, "holding": [2], "waiting_for": 1, "abortable": False}],
+            [],
+        )
+        result = solve_checkpoints(payload)
+        self.assertEqual(result["status"], "unresolvable")
+        self.assertEqual(result["events"], [])
+        self.assertEqual(result["stuck"], [1, 2])
+
+    def test_prefix_events_precede_rollback(self):
+        payload = mk_checkpoint_payload(
+            [{"id": 1, "holding": [1], "waiting_for": 2,
+              "abortable": True, "abort_cost": 5},
+             {"id": 2, "holding": [2], "waiting_for": 1, "abortable": False},
+             {"id": 3, "holding": [], "waiting_for": None,
+              "abortable": True, "abort_cost": 1}],
+            [{"id": "k1", "job": 1, "keep": [], "cost": 1}],
+        )
+        result = solve_checkpoints(payload)
+        self.assertEqual(result["status"], "recovered")
+        self.assertEqual(result["events"][0],
+                         {"type": "complete", "job": 3, "released": []})
+        self.assertEqual(result["events"][1],
+                         {"type": "rollback", "job": 1, "checkpoint": "k1",
+                          "released": [1], "retained": []})
+        active, _, _ = replay_checkpoint_events(payload, result["events"])
+        self.assertEqual(active, set())
+
+    def test_payload_not_mutated_and_result_serialisable(self):
+        payload = mk_checkpoint_payload(
+            [{"id": 1, "holding": [1, 2], "waiting_for": 3,
+              "abortable": True, "abort_cost": 9},
+             {"id": 2, "holding": [3], "waiting_for": 2, "abortable": False}],
+            [{"id": "k1", "job": 1, "keep": [1], "cost": 2}],
+        )
+        snapshot = copy.deepcopy(payload)
+        result = solve_checkpoints(payload)
+        self.assertEqual(payload, snapshot)
+        json.dumps(result)
+
+    def test_checkpoint_validation(self):
+        jobs = [{"id": 1, "holding": [1], "waiting_for": 2,
+                 "abortable": True, "abort_cost": 2},
+                {"id": 2, "holding": [2], "waiting_for": 1, "abortable": False}]
+        good = {"id": "k1", "job": 1, "keep": [1], "cost": 1}
+        cases = [
+            ([dict(good, extra=1)], "checkpoint fields invalid"),
+            ([{"id": "k1", "job": 1, "keep": [1]}], "checkpoint fields invalid"),
+            (["nope"], "checkpoint fields invalid"),
+            ([dict(good, id="")], "checkpoint id invalid"),
+            ([dict(good, id=7)], "checkpoint id invalid"),
+            ([good, dict(good)], "checkpoint id invalid"),
+            ([dict(good, job=99)], "unknown checkpoint job"),
+            ([dict(good, job="1")], "unknown checkpoint job"),
+            ([dict(good, keep=[1, 1])], "keep must be unique"),
+            ([dict(good, keep="x")], "keep must be unique"),
+            ([dict(good, keep=[2])], "cannot retain unowned resource"),
+            ([dict(good, cost=0)], "positive rollback cost"),
+            ([dict(good, cost=-1)], "positive rollback cost"),
+            ([dict(good, cost=True)], "positive rollback cost"),
+            ([dict(good, cost="3")], "positive rollback cost"),
+            ([dict(good, id=f"c{i}") for i in range(21)], "too many checkpoints"),
+        ]
+        for checkpoints, fragment in cases:
+            with self.subTest(fragment=fragment):
+                with self.assertRaises(ValueError) as ctx:
+                    solve_checkpoints(mk_checkpoint_payload(jobs, checkpoints))
+                self.assertIn(fragment, str(ctx.exception))
+        with self.assertRaises(ValueError) as ctx:
+            solve_checkpoints(mk_checkpoint_payload(jobs, "nope"))
+        self.assertIn("checkpoints must be a list", str(ctx.exception))
+
+
+class RandomCheckpointCrossCheckTests(unittest.TestCase):
+    def test_random_instances(self):
+        for seed in range(80):
+            with self.subTest(seed=seed):
+                rng = random.Random(10_000 + seed)
+                payload = random_checkpoint_payload(rng)
+                snapshot = copy.deepcopy(payload)
+                result = solve_checkpoints(payload)
+
+                self.assertEqual(payload, snapshot, "solve must not mutate its input")
+                json.dumps(result)
+                self.assertFalse(any(ev["type"] == "abort" for ev in result["events"]))
+
+                # Independent replay of the returned event stream.
+                active, _, holder = replay_checkpoint_events(payload, result["events"])
+
+                # Independent minimality check by combination enumeration.
+                expected = brute_force_min_checkpoints(payload)
+
+                if result["status"] == "completed":
+                    self.assertEqual(expected, [])
+                    self.assertEqual(active, set())
+                    self.assertEqual(result["checkpoints"], [])
+                    self.assertEqual(result["cost"], 0)
+                elif result["status"] == "recovered":
+                    self.assertEqual(active, set(), "all jobs must complete")
+                    self.assertTrue(all(h is None for h in holder.values()))
+                    self.assertIsNotNone(expected)
+                    self.assertEqual((result["cost"], result["checkpoints"]), expected)
+                    chosen = {c["id"]: c for c in payload["checkpoints"]}
+                    jobs = [chosen[c]["job"] for c in result["checkpoints"]]
+                    self.assertEqual(len(jobs), len(set(jobs)),
+                                     "at most one checkpoint per job")
+                    self.assertEqual(result["cost"],
+                                     sum(chosen[c]["cost"] for c in result["checkpoints"]))
+                else:
+                    self.assertEqual(result["status"], "unresolvable")
+                    self.assertIsNone(expected)
+                    self.assertEqual(sorted(active), result["stuck"])
 
 
 if __name__ == "__main__":

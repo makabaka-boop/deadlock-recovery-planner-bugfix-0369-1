@@ -54,3 +54,7 @@ python3 -m unittest test_deadlock_simulator -v   # 运行测试
 回放中仍按原授予规则裁决：完成阶段先于授予阶段，空闲资源按资源 ID、等待者按作业 ID 排序。
 回退作业先继续原等待请求，再按资源 ID 递增重新取得回退释放的资源；一次最多等待一个资源，
 所有需求得到满足才可正常完成。回退后的授予与释放均须在回放中体现，未回退作业的需求不变。
+
+检查点模式响应 `status` 为 `completed` / `recovered` / `unresolvable`；`events` 在
+`grant` / `complete` 之外包含 `rollback` 事件（job、checkpoint、released、retained）；
+`cost` 为回退总成本，`checkpoints` 为排序后的检查点 ID 列表。

@@ -50,7 +50,8 @@ class SimulatorHandler(BaseHTTPRequestHandler):
             self._send_json(400, {"error": f"invalid JSON: {exc}"})
             return
         try:
-            result = solve_checkpoints(payload) if payload.get('mode') == 'checkpoint' else solve(payload)
+            use_checkpoints = isinstance(payload, dict) and payload.get('mode') == 'checkpoint'
+            result = solve_checkpoints(payload) if use_checkpoints else solve(payload)
         except ValueError as exc:
             self._send_json(400, {"error": str(exc)})
             return

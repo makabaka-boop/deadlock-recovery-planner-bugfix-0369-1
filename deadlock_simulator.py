@@ -38,7 +38,7 @@ situation is reported explicitly; protected resources are never
 force-released.
 """
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from itertools import combinations
 
 MAX_JOBS = 12
@@ -56,6 +56,10 @@ class Job:
     waiting_for: int      # resource id or None
     abortable: bool
     abort_cost: int       # positive int when abortable, else None
+    # Resources a rolled-back job must still re-acquire, in ascending id
+    # order, once its current wait is granted (checkpoint recovery only;
+    # always empty during plain abort-mode simulation).
+    needs: list = field(default_factory=list)
 
 
 @dataclass
@@ -74,7 +78,8 @@ class State:
 
     def clone(self):
         return State(
-            {jid: Job(j.id, set(j.holding), j.waiting_for, j.abortable, j.abort_cost)
+            {jid: Job(j.id, set(j.holding), j.waiting_for, j.abortable, j.abort_cost,
+                      list(j.needs))
              for jid, j in self.jobs.items()},
             {rid: Resource(r.id, r.holder) for rid, r in self.resources.items()},
         )
@@ -186,6 +191,12 @@ def simulate(state):
     Mutates ``state``.  Returns ``(events, stuck)`` where ``events`` is the
     ordered replay of grant/complete events and ``stuck`` is the sorted list
     of job ids still active (deadlocked) when the simulation stalls.
+
+    A job may carry a ``needs`` queue of resources it must still re-acquire
+    (set by checkpoint rollback).  When such a job is granted the resource
+    it waits for, it immediately starts waiting for the next queued
+    resource instead of becoming ready to complete; it completes only once
+    the queue is drained.
     """
     events = []
     while True:
@@ -217,7 +228,9 @@ def simulate(state):
             state.resources[rid].holder = jid
             job = state.jobs[jid]
             job.holding.add(rid)
-            job.waiting_for = None
+            # A job with queued re-acquisitions keeps waiting for the next
+            # one; only a job with nothing left to acquire stops waiting.
+            job.waiting_for = job.needs.pop(0) if job.needs else None
             events.append({"type": "grant", "job": jid, "resource": rid})
 
     return events, sorted(state.jobs)
