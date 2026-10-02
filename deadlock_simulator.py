@@ -22,8 +22,9 @@ The simulator repeats rounds until no further progress is possible:
    granted to the waiting job with the smallest job id
    (grants are applied in ascending resource id order).
 
-A job stops waiting exactly when its requested resource is granted to it,
-which makes it complete in the next completion phase.
+A granted job either stops waiting -- and completes in the next completion
+phase -- or, after a checkpoint rollback, immediately waits for the next
+resource in its pending re-acquisition queue (see ``checkpoint_runtime``).
 
 Deadlock resolution
 -------------------
@@ -56,6 +57,8 @@ class Job:
     waiting_for: int      # resource id or None
     abortable: bool
     abort_cost: int       # positive int when abortable, else None
+    pending: tuple = ()   # further resources to request next, in order
+                          # (only used by checkpoint rollback recovery)
 
 
 @dataclass
@@ -74,7 +77,8 @@ class State:
 
     def clone(self):
         return State(
-            {jid: Job(j.id, set(j.holding), j.waiting_for, j.abortable, j.abort_cost)
+            {jid: Job(j.id, set(j.holding), j.waiting_for, j.abortable, j.abort_cost,
+                      j.pending)
              for jid, j in self.jobs.items()},
             {rid: Resource(r.id, r.holder) for rid, r in self.resources.items()},
         )
@@ -217,7 +221,12 @@ def simulate(state):
             state.resources[rid].holder = jid
             job = state.jobs[jid]
             job.holding.add(rid)
-            job.waiting_for = None
+            if job.pending:
+                # Rolled-back job: re-acquire the next released resource.
+                job.waiting_for = job.pending[0]
+                job.pending = job.pending[1:]
+            else:
+                job.waiting_for = None
             events.append({"type": "grant", "job": jid, "resource": rid})
 
     return events, sorted(state.jobs)
